@@ -1,0 +1,471 @@
+---
+title: "SIR_Branching"
+author: "Harry XIe"
+date: "April 18, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Branching Transition Probability
+```{r}
+library(matrixStats)
+library(MultiBD)
+
+#log version of A,B helper functions to handle larger numbers
+A.vec.log <- function(t, m, n, k, j, beta, gam){
+  return(lgamma(m+1) - lgamma(m-k-j+1) - (k*beta*n*t) + 
+           (m-k-j) * log((1 - beta*n*exp(-gam*t)/(beta*n-gam) -exp(-beta*n*t) *(1 - beta*n/(beta*n-gam)))) 
+         + j * log((beta*n*(exp(-gam*t) - exp(-beta*n*t)) / (beta*n - gam))))
+}
+
+B.vec.log <- function(t, n, j, gam){
+  return(lgamma(n+1) - lgamma(n-j+1) + (n-j)*log(1 - exp(-gam*t))- gam*j*t)
+}
+
+# note: of course k can never be greater than m
+# uses log versions to handle large populations
+# put k and l first for use with outer()
+TransProb_mnkl <- function(m,n,k,l,t, beta, gam){
+  if(k>m){
+    return(0)
+  }
+  if(m<0 || n<0 || k<0 || l<0){
+    return(0)
+  }
+  logAA <- logBB <- rep(0,l+1)
+  aj <- rev(seq(0,min(m-k,l)))
+  bj <- seq(0, min(n,l))
+  c <- lgamma(l+1) - lgamma(seq(0,l) + 1) - lgamma(l+1 - seq(0,l))
+  logAA[(l+1-min(m-k,l)) : (l+1)] <- A.vec.log(t, m, n, k, aj, beta, gam)
+  logBB[1 : (min(n,l)+1)] <- B.vec.log(t, n, bj, gam)
+  term <- c + logAA + logBB
+  return(exp(logSumExp(term) - lgamma(k+1) - lgamma(l+1)))
+}
+```
+
+### Trajectory Proposal
+```{r}
+# sample next infected value
+# @input
+#  S0: previous susceptible
+#  I0: previous infected
+#  S1: current susceptible
+#  t: time interval
+#  beta: infection rate
+#  gam: recovery rate
+#  ratio: approximation threshold
+# @return
+#  dataframe that contains I values and their probabilities
+propose_next <- function(S0, I0, S1, t, beta, gam){
+  PROB <- NULL
+  PRO_I <- NULL
+  range_I <- 1:(I0+S0-S1)
+  for (i in range_I){
+    PROB = c(PROB, TransProb_mnkl(S0,I0,S1,i,t,beta,gam))
+  }
+  # print(PROB)
+  res <- data.frame("I"=range_I, "prob"=PROB)
+  return(res)
+}
+
+# propose_next(254, 7, 235, 0.5, 0.0212, 3.39)
+```
+
+```{r}
+# propose entire trajectory
+# @input
+#  S: vector of susceptibles
+#  I0: initial infected value
+#  t: time vector
+#  beta: infection rate
+#  gam: recovery rate
+#  ratio: approximation threshold
+# @return:
+#  dataframe with I = proposed values and prob = associated probabilities
+propose_trajectory <- function(S, I0, t, beta, gam){
+  n <- length(S)
+  I <- prob <- rep(0,n)
+  I[1] <- I0
+  prob[1] <- 1
+  for (k in 2:n) {
+    temp <- propose_next(S[k-1], I[k-1], S[k], t[k]-t[k-1], beta, gam)
+    I[k] <- sample(temp$I, 1, replace=TRUE, prob=temp$prob)
+    prob[k] <- temp$prob[match(I[k], temp$I)]
+  }
+  res_df = data.frame("I"=I, "prob"=prob)
+  return(res_df)
+}
+
+# # trial run
+# data(Eyam)
+# ptm <- proc.time()
+# res <- propose_trajectory(Eyam$S, Eyam$I[1], Eyam$time, 0.019, 3.204)
+# print(res)
+# proc.time() - ptm
+```
+
+```{r}
+# wrapper function that returns a proposed dataframe
+# @input
+#  S: susceptible vector
+#  I0: initial infected
+#  t: time vector
+#  beta: infection rate
+#  gam: recovery rate
+# @returns
+#  proposed dataframe with the following schema
+#  I,S,R = vectors of corresponding proposed values
+#  prob = vectors of probability associated with the proposed values
+make_proposal_df <- function(S, t, I0, beta, gam, seed=NULL){
+  if (!is.null(seed)){
+    set.seed(seed)
+  }
+  N <- S[1]+I0
+  I_df = propose_trajectory(S, I0, t, beta, gam)
+  R <- N - (S+I_df$I)
+  res <- data.frame("time"=t, "S"=S, "I"=I_df$I, "R"=R, "prob"=I_df$prob)
+  return(res)
+}
+
+# # trial run
+# data(Eyam)
+# make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], 0.019, 3.204)
+```
+
+
+### Continue Fraction Likelihood
+```{r}
+loglik_sir <- function(param, data) {
+  alpha <- exp(param[1])
+  beta  <- exp(param[2])
+  if(length(unique(rowSums(data[, c("S", "I", "R")]))) > 1) 
+    {stop ("Please make sure the data conform with a closed population")}
+  sum(sapply(1:(nrow(data) - 1), 
+            function(k) {
+              log(SIR_prob(
+              t  = data$time[k + 1] - data$time[k],
+              alpha = alpha, beta = beta,S0 = data$S[k], I0 = data$I[k],
+              nSI = data$S[k] - data$S[k + 1], nIR = data$R[k + 1] - data$R[k],
+              computeMode = 4, nblocks = 80)
+              [data$S[k] - data$S[k + 1] + 1,data$R[k + 1] - data$R[k] + 1])
+            }
+      )
+  )
+}
+```
+
+### Proposal likelihood ratio
+```{r}
+# use the un-normalized probabilities
+loglik_pro <- function(param, data){
+  return(sum(log(data$prob)))
+}
+```
+
+### compute acceptance ratio
+```{r}
+# compute acceptance ratio in MH
+# @input
+#  param: vector (alpha, beta)
+#  pro_df_old: dataframe that contains the old proposal as returned from make_proposal_df()
+#  pro_df_new: ... the new proposal ...
+# @returns
+#  r: acceptance ratio as calculated as (likelihood(new)/likelihood(old)) * (proposal(old)/proposal(new))
+compute_ratio_data <- function(param, pro_df_old, pro_df_new){
+  log.ratio1 = (loglik_sir(param, pro_df_new) - loglik_sir(param, pro_df_old))
+  log.ratio2 = (loglik_pro(param, pro_df_old) - loglik_pro(param, pro_df_new))
+  return(exp(log.ratio1 + log.ratio2))
+}
+
+# log_likelihood(new) - log_likelihood(old)
+loglik_ratio <- function(param, pro_df_old, pro_df_new){
+  log.ratio1 = (loglik_sir(param, pro_df_new) - loglik_sir(param, pro_df_old))
+  return(log.ratio1)
+}
+
+# log_proposal(old) - log_proposal(new)
+logpro_ratio <- function(param, pro_df_old, pro_df_new){
+  log.ratio2 = (loglik_pro(param, pro_df_old) - loglik_pro(param, pro_df_new))
+  return(log.ratio2)
+}
+
+compute_ratio_param <- function(pro_df, param_old, param_new){
+  log.ratio = (loglik_sir(param_new, pro_df) - loglik_sir(param_old, pro_df))
+  if (log.ratio < (-100)){
+    return(0)
+  }
+  return(exp(log.ratio))
+}
+
+# # trial run
+# data(Eyam)
+# alpha <- 3.204
+# beta <- 0.019
+# param <- log(c(alpha, beta))
+# pro_df1 <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], beta, alpha)
+# pro_df2 <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], beta, alpha)
+# print("old proposal")
+# print(pro_df1$I)
+# print("new proposal")
+# print(pro_df2$I)
+# 
+# r <- compute_ratio_data(param, pro_df1, pro_df2)
+# print(r)
+```
+
+### simple MH with known alpha, beta
+```{r}
+# data(Eyam)
+# 
+# alpha <- 3.204
+# beta <- 0.019
+# param <- log(c(alpha, beta))
+# old_df <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], beta, alpha)
+# n.iter <- 100
+# cnt <- 0
+# 
+# x_lik <- rep(0, n.iter)
+# x_pro <- rep(0, n.iter)
+# 
+# ptm <- proc.time()
+# for(i in 1:n.iter){
+#   new_df <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], beta, alpha)
+#   # r = compute_ratio_data(param, old_df, new_df)
+#   
+#   r1 = loglik_ratio(param, old_df, new_df)
+#   x_lik[i] = r1
+#   r2 = logpro_ratio(param, old_df, new_df)
+#   x_pro[i] = r2
+#   r = exp(r1 + r2)
+#   
+#   u = runif(1)
+#   if(u <= r){
+#     old_df = new_df
+#     cnt <- cnt+1
+#   }
+# }
+# proc.time() - ptm
+# 
+# print("acceptance ratio")
+# print(cnt/n.iter)
+```
+
+```{r}
+# # check likelihood ratio
+# plot(1:n.iter, x_lik)
+# 
+# # check proposal ratio
+# plot(1:n.iter, x_pro)
+# 
+# # checking proposal likelihood values
+# data(Eyam)
+# alpha <- 3.204
+# beta <- 0.019
+# param <- log(c(alpha, beta))
+# temp <- rep(0,100)
+# for (i in 1:100){
+#   pro_df <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], beta, alpha)
+#   temp[i] = loglik_pro(param, pro_df)
+# }
+# plot(1:100, temp)
+```
+
+### MH
+```{r}
+# data(Eyam)
+# set.seed(10)
+# n.iter <- 20
+# b <- 0.04
+# a <- 4
+# b.std <- 0.02
+# a.std <- 1
+# old_df <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], b, a)
+
+# for(i in 1:n.iter){
+#   # parameters update
+#   a.new <- rnorm(1, a, a.std)
+#   b.new <- rnorm(1, b, b.std)
+#   print(paste("a.new: ", a.new))
+#   print(paste("b.new: ", b.new))
+#   r1 = compute_ratio_param(old_df, log(c(a,b)), log(c(a.new,b.new)))
+#   print(paste("r1: ", r1))
+#   u1 = runif(1)
+#   if(u1 <= r1){
+#     a = a.new
+#     b = b.new
+#   }
+#   
+#   # proposal update
+#   new_df <- make_proposal_df(Eyam$S, Eyam$time, Eyam$I[1], b, a)
+#   r2 = compute_ratio_data(log(c(a,b)), old_df, new_df)
+#   print(paste("r2: ", r2))
+#   u2 = runif(1)
+#   if(u2 <= r2){
+#     old_df = new_df
+#   }
+# }
+```
+
+### simulate stochastic SIR model
+```{r}
+# generate a dataframe with stochastic sir data
+# @input
+#  size: dataframe size
+#  alpha, beta: parameters
+#  S0, I0, N: initial values
+#  h: time interval
+#  truncate: truncate tailing zeroes
+generate_ssir_df <- function(size, alpha, beta, S0, I0, N, h=0.001, seed=123, truncate=TRUE){
+  set.seed(seed)
+  I <- S <- R <- rep(0, size)
+  time <- seq(from=0, by=h, length.out=size)
+  I[1] <- I0
+  S[1] <- S0
+  R[1] <- N-I0-S0
+  for (i in 2:size){
+    u <- runif(1)
+    pr.infection <- beta * S[i-1] * I[i-1] * h
+    pr.recovery <- alpha * I[i-1] * h
+    if (u < pr.infection){
+      S[i] <- S[i-1] - 1
+      I[i] <- I[i-1] + 1
+    }
+    else if (u < pr.infection + pr.recovery){
+      S[i] <- S[i-1]
+      I[i] <- I[i-1] - 1
+    }
+    else {
+      S[i] <- S[i-1]
+      I[i] <- I[i-1]
+    }
+    R[i] <- N - I[i] - S[i]
+    # optional: stop when infection dies down
+    if(truncate == TRUE && I[i] == 0){
+      I <- I[1:i]
+      S <- S[1:i]
+      R <- R[1:i]
+      time <- time[1:i]
+      break
+    } 
+  }
+  result <- data.frame("S"=S, "I"=I, "R"=R, "time"=time)
+  return(result)
+}
+
+# # trial run
+# generate_ssir_df(5000, 3.22, 0.0197, 254, 7, 261)
+# plot(1:nrow(res), res$I, type='l')
+```
+
+```{r}
+# mask ssir dataframe for branching proposal inference
+# @input
+#  ssir_df: ssir_df generated from generate_ssir_df
+#  length.out: size of observed dataframe
+create_observed_df <- function(ssir_df, length.out){
+  n.rows = nrow(ssir_df)
+  interval = n.rows/(length.out-1)
+  idx <- 1 + floor((0:(length.out-1))*interval)
+  idx[length.out] = n.rows
+  res <- ssir_df[idx,]
+  return(res)
+}
+
+# # trial run
+# full_df <- generate_ssir_df(5000, 3.22, 0.0197, 254, 7, 261)
+# observed <- create_observed_df(full_df, 100)
+# observed
+```
+
+### MH with known parameters with simulated data
+```{r}
+# full_df <- generate_ssir_df(5000, 3.22, 0.0197, 254, 7, 261)
+# observed <- create_observed_df(full_df, 100)
+# 
+# alpha <- 3.22
+# beta <- 0.0197
+# param <- log(c(alpha, beta))
+# old_df <- make_proposal_df(observed$S, observed$time, observed$I[1], beta, alpha)
+# n.iter <- 1000
+# cnt <- 0
+# 
+# x_lik <- rep(0, n.iter)
+# x_pro <- rep(0, n.iter)
+# 
+# ptm <- proc.time()
+# for(i in 1:n.iter){
+#   new_df <- make_proposal_df(observed$S, observed$time, observed$I[1], beta, alpha)
+#   # r = compute_ratio_data(param, old_df, new_df)
+#   
+#   r1 = loglik_ratio(param, old_df, new_df)
+#   x_lik[i] = r1
+#   r2 = logpro_ratio(param, old_df, new_df)
+#   x_pro[i] = r2
+#   r = exp(r1 + r2)
+#   
+#   u = runif(1)
+#   if(u <= r){
+#     old_df = new_df
+#     cnt <- cnt+1
+#   }
+# }
+# proc.time() - ptm
+# 
+# print("acceptance ratio")
+# print(cnt/n.iter)
+```
+
+### MH with unknown parameters with simulated data
+```{r}
+full_df <- generate_ssir_df(5000, 3.22, 0.0197, 254, 7, 261)
+observed <- create_observed_df(full_df, 100)
+
+set.seed(123)
+
+n.iter <- 1000
+b <- 0.02
+a <- 3
+b.std <- 0.001
+a.std <- 0.2
+old_df <- make_proposal_df(observed$S, observed$time, observed$I[1], b, a)
+
+pa.cnt <- 0
+da.cnt <- 0
+
+ptm <- proc.time()
+for(i in 1:n.iter){
+ # parameters update
+ a.new <- rnorm(1, a, a.std)
+ b.new <- rnorm(1, b, b.std)
+ # print(paste("a.new: ", a.new))
+ # print(paste("b.new: ", b.new))
+ r1 = compute_ratio_param(old_df, log(c(a,b)), log(c(a.new,b.new)))
+ # print(paste("r1: ", r1))
+ u1 = runif(1)
+ if(u1 <= r1){
+   a = a.new
+   b = b.new
+   pa.cnt = pa.cnt + 1
+ }
+
+ # proposal update
+ new_df <- make_proposal_df(observed$S, observed$time, observed$I[1], b, a)
+ r2 = compute_ratio_data(log(c(a,b)), old_df, new_df)
+ # print(paste("r2: ", r2))
+ u2 = runif(1)
+ if(u2 <= r2){
+   old_df = new_df
+   da.cnt = da.cnt + 1
+ }
+}
+
+print(paste("final parameters: ", a, b))
+print(paste("parameter ar: ", pa.cnt/n.iter))
+print(paste("data ar: ", da.cnt/n.iter))
+
+proc.time() - ptm
+```
+
